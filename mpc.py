@@ -83,11 +83,15 @@ class ModelPredictiveControl:
     tol, max_iter, solver_options : IPOPT settings
     output : optional output map h(x) -> (p,) with h(0) = 0, written with NumPy
         operations (traced by CasADi like the model); Q is then (p, p)
+    step : optional CasADi Function (x, u) -> x+ used as the one-interval
+        predictor instead of RK4 on the model (e.g. a data-driven surrogate);
+        the model then only supplies the dimensions and the default plant, and
+        P must be None or an array
     """
 
     def __init__(self, model, horizon, dt, Q=None, R=None, P="lqr", u_min=None, u_max=None,
                  x_min=None, x_max=None, n_substeps=4, tol=1e-8, max_iter=200, solver_options=None,
-                 output=None):
+                 output=None, step=None):
         import casadi as ca
         from dynamics import _to_casadi
         n, m, N = model.n, model.m, int(horizon)
@@ -99,6 +103,8 @@ class ModelPredictiveControl:
         self.Q = np.eye(p) if Q is None else np.atleast_2d(Q).astype(float)
         self.R = np.eye(m) if R is None else np.atleast_2d(R).astype(float)
         if isinstance(P, str):
+            if step is not None:
+                raise ValueError("P = 'lqr' uses the model; pass P = None or an array with a custom step.")
             A, B = model.linearize()
             h = 1e-6                                                    # C = Dh(0) by central differences
             C = np.column_stack([(np.atleast_1d(output(h * e)) - np.atleast_1d(output(-h * e))) / (2 * h)
@@ -110,17 +116,20 @@ class ModelPredictiveControl:
         self.u_min, self.u_max = bound(u_min, m, -np.inf), bound(u_max, m, np.inf)
         self.x_min, self.x_max = bound(x_min, n, -np.inf), bound(x_max, n, np.inf)
 
-        # one sampling interval of the model: RK4 with substeps
-        rhs = model.casadi_rhs()
+        # one sampling interval of the model: RK4 with substeps (or the given predictor)
         xs, us = ca.SX.sym("x", n), ca.SX.sym("u", m)
-        h, xk = self.dt / n_substeps, xs
-        for _ in range(n_substeps):
-            k1 = rhs(xk, us)
-            k2 = rhs(xk + 0.5 * h * k1, us)
-            k3 = rhs(xk + 0.5 * h * k2, us)
-            k4 = rhs(xk + h * k3, us)
-            xk = xk + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-        self._step = ca.Function("Phi", [xs, us], [xk])
+        if step is None:
+            rhs = model.casadi_rhs()
+            h, xk = self.dt / n_substeps, xs
+            for _ in range(n_substeps):
+                k1 = rhs(xk, us)
+                k2 = rhs(xk + 0.5 * h * k1, us)
+                k3 = rhs(xk + 0.5 * h * k2, us)
+                k4 = rhs(xk + h * k3, us)
+                xk = xk + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+            self._step = ca.Function("Phi", [xs, us], [xk])
+        else:
+            self._step = step
         x_obj = np.empty(n, dtype=object)
         for i in range(n):
             x_obj[i] = xs[i]

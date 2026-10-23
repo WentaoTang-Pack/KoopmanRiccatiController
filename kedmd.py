@@ -148,21 +148,31 @@ class KedmdSurrogate:
         Cluster size N_c >= m + 1 (nearest data points of each center).
     regularization : float
         lambda >= 0 in (K_X + lambda I)^{-1}  (0: interpolation).
+    drift_kernel : MercerKernel, optional
+        Separate kernel for g_hat_0 (default: ``kernel``).  With a linear-type
+        kernel (e.g. :func:`kernel.linear_wendland_kernel`), g_hat_0(0) = 0 holds
+        by construction for any data and regularization; centers at the origin
+        are then left out of the drift interpolation (where g_0 = 0 anyway).
 
     After :meth:`fit`:
     H : (d, n, m+1) local estimates of [g_0(x_l) | G(x_l)];
-    coef : (n (m+1), d) interpolation coefficients, so that
-           [g_hat_0(x) | G_hat(x)] = reshape(coef k_X(x));
+    coef_drift : (n, d_0) and coef_input : (n m, d) interpolation coefficients, so that
+           g_hat_0(x) = coef_drift k_0(x),  vec G_hat(x) = coef_input k_X(x);
     info : diagnostics (condition number of K_X, cluster radii, ranks, time).
     """
 
-    def __init__(self, kernel, centers, n_neighbors, regularization=0.0):
+    def __init__(self, kernel, centers, n_neighbors, regularization=0.0, drift_kernel=None):
         self.kernel = kernel
+        self.drift_kernel = kernel if drift_kernel is None else drift_kernel
         self.centers = np.asarray(centers, dtype=float)
         self.n, self.d = self.centers.shape
         self.n_neighbors = int(n_neighbors)
         self.regularization = float(regularization)
-        self.m = self.coef = None
+        self.m = self.coef_drift = self.coef_input = None
+        # centers used for g_hat_0: all, except the origin for a separate (linear-type) drift kernel
+        self._drift_mask = (np.ones(self.d, dtype=bool) if drift_kernel is None
+                            else np.linalg.norm(self.centers, axis=0) > 1e-14)
+        self.drift_centers = self.centers[:, self._drift_mask]
 
     def fit(self, data, report=True):
         t0 = time.perf_counter()
@@ -177,26 +187,32 @@ class KedmdSurrogate:
             Ul = np.vstack([np.ones((1, Nc)), U[:, idx[l]]])
             H[l] = Xp[:, idx[l]] @ np.linalg.pinv(Ul)
 
-        # Step 2: kernel interpolation of every entry of H
+        # Step 2: kernel interpolation of every entry of H (g_0 and G with their own kernels)
+        lam = self.regularization
         K = self.kernel.matrix(self.centers)
-        Y = H.reshape(self.d, -1).T                          # (n (m+1), d), columns = centers
-        self.coef = np.linalg.solve(K + self.regularization * np.eye(self.d), Y.T).T
+        K0 = self.drift_kernel.matrix(self.drift_centers)
+        Y0 = H[self._drift_mask, :, 0]                        # (d_0, n), rows = centers
+        Y1 = H[:, :, 1:].reshape(self.d, -1)                  # (d, n m)
+        self.coef_drift = np.linalg.solve(K0 + lam * np.eye(K0.shape[0]), Y0).T
+        self.coef_input = np.linalg.solve(K + lam * np.eye(self.d), Y1).T
         self.H = H
-        ev = np.linalg.eigvalsh(K)
-        self.info = {"cond_K": float(ev[-1] / ev[0]), "cluster_radius_max": float(dist.max()),
-                     "wall_time": time.perf_counter() - t0}
+        ev, ev0 = np.linalg.eigvalsh(K), np.linalg.eigvalsh(K0)
+        self.info = {"cond_K": float(ev[-1] / ev[0]), "cond_K_drift": float(ev0[-1] / ev0[0]),
+                     "cluster_radius_max": float(dist.max()), "wall_time": time.perf_counter() - t0}
         if report:
             print(f"[kEDMD] d = {self.d} centers, N_c = {Nc}, lambda = {self.regularization:g}, "
-                  f"{X.shape[1]} data triplets; cond(K_X) = {self.info['cond_K']:.2e}, "
-                  f"max cluster radius = {self.info['cluster_radius_max']:.2e}: "
+                  f"{X.shape[1]} data triplets; cond(K_X) = {self.info['cond_K']:.2e}"
+                  + (f", cond(K_drift) = {self.info['cond_K_drift']:.2e}" if self.drift_kernel is not self.kernel else "")
+                  + f", max cluster radius = {self.info['cluster_radius_max']:.2e}: "
                   f"total computational time = {self.info['wall_time']:.4f} s")
         return self
 
     # -- evaluation -----------------------------------------------------------
 
     def _HX(self, X):
-        Kx = self.kernel.matrix(self.centers, X)             # (d, M)
-        return (self.coef @ Kx).reshape(self.n, self.m + 1, -1)
+        g0 = self.coef_drift @ self.drift_kernel.matrix(self.drift_centers, X)          # (n, M)
+        G = (self.coef_input @ self.kernel.matrix(self.centers, X)).reshape(self.n, self.m, -1)
+        return np.concatenate([g0[:, None, :], G], axis=1)
 
     def g0(self, X):
         """g_hat_0 at states X (n,) or (n, M)."""
@@ -223,14 +239,16 @@ class KedmdSurrogate:
         import casadi as ca
         x = ca.SX.sym("x", self.n)
         u = ca.SX.sym("u", self.m)
-        kx = self.kernel.casadi_row(x, self.centers).T       # (d, 1)
-        Hx = ca.reshape(ca.mtimes(ca.DM(self.coef), kx), self.m + 1, self.n).T   # (n, m+1)
-        xp = Hx[:, 0] + ca.mtimes(Hx[:, 1:], u)
+        g0 = ca.mtimes(ca.DM(self.coef_drift), self.drift_kernel.casadi_row(x, self.drift_centers).T)
+        G = ca.reshape(ca.mtimes(ca.DM(self.coef_input), self.kernel.casadi_row(x, self.centers).T),
+                       self.m, self.n).T                      # (n, m)
+        xp = g0 + ca.mtimes(G, u)
         return ca.Function("F_hat", [x, u], [xp], ["x", "u"], ["xp"])
 
     def __repr__(self):
-        return (f"KedmdSurrogate(kernel={self.kernel.name!r}, d={self.d}, "
-                f"N_c={self.n_neighbors}, lambda={self.regularization:g}, fitted={self.coef is not None})")
+        drift = "" if self.drift_kernel is self.kernel else f", drift_kernel={self.drift_kernel.name!r}"
+        return (f"KedmdSurrogate(kernel={self.kernel.name!r}{drift}, d={self.d}, "
+                f"N_c={self.n_neighbors}, lambda={self.regularization:g}, fitted={self.coef_input is not None})")
 
 
 # ---------------------------------------------------------------------------
